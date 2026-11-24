@@ -1,0 +1,258 @@
+name: pg-migrator
+
+networks:
+  # Only frontend (Nginx) <-> backend (Go API)
+  frontend-net:
+    driver: bridge
+  # Strictly isolated internal network: backend <-> pg-meta (NO internet egress)
+  meta-net:
+    driver: bridge
+    internal: true
+  # Strictly isolated internal network: migration data plane (NO internet egress)
+  migration-net:
+    driver: bridge
+    internal: true
+
+volumes:
+  pg-meta-data:
+  pg-source-data:
+  pg-target-data:
+
+services:
+  # =========================================================================
+  # 1. PostgreSQL State Store (pg-meta) — stores jobs, encrypted creds, logs, metrics
+  # =========================================================================
+  pg-meta:
+    image: postgres:16.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pg_migrator_meta
+      POSTGRES_USER: meta_admin
+      POSTGRES_PASSWORD: ${META_DB_PASSWORD:?META_DB_PASSWORD is required - run make init-env}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    volumes:
+      - pg-meta-data:/var/lib/postgresql/data
+    networks:
+      - meta-net
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meta_admin -d pg_migrator_meta"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  # =========================================================================
+  # 2. Docker Lab Source DB (Cloud A — PG 15 with wal_level=logical)
+  # =========================================================================
+  pg-source:
+    image: postgres:15.8-alpine
+    restart: unless-stopped
+    shm_size: 512mb
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - password_encryption=scram-sha-256
+    environment:
+      POSTGRES_DB: sourcedb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${SOURCE_ADMIN_PASSWORD:?SOURCE_ADMIN_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+      SOURCE_MIGRATOR_PASSWORD: ${SOURCE_MIGRATOR_PASSWORD:?SOURCE_MIGRATOR_PASSWORD is required}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+    volumes:
+      - pg-source-data:/var/lib/postgresql/data
+      - ./lab/pg-source/init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    networks:
+      - migration-net
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sourcedb"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  # =========================================================================
+  # 3. Docker Lab Target DB (Cloud B — PG 16, cross-version upgrade 15 -> 16)
+  # =========================================================================
+  pg-target:
+    image: postgres:16.4-alpine
+    restart: unless-stopped
+    shm_size: 512mb
+    command:
+      - postgres
+      - -c
+      - max_logical_replication_workers=8
+      - -c
+      - max_worker_processes=16
+      - -c
+      - max_sync_workers_per_subscription=4
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - password_encryption=scram-sha-256
+    environment:
+      POSTGRES_DB: targetdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${TARGET_ADMIN_PASSWORD:?TARGET_ADMIN_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+      TARGET_MIGRATOR_PASSWORD: ${TARGET_MIGRATOR_PASSWORD:?TARGET_MIGRATOR_PASSWORD is required}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+    volumes:
+      - pg-target-data:/var/lib/postgresql/data
+      - ./lab/pg-target/init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    networks:
+      - migration-net
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d targetdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  # =========================================================================
+  # 4. Toxiproxy — Cross-cloud WAN latency & network drop simulator
+  # =========================================================================
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    restart: unless-stopped
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/toxiproxy.json"]
+    volumes:
+      - ./lab/toxiproxy/toxiproxy.json:/etc/toxiproxy/toxiproxy.json:ro
+    networks:
+      - migration-net
+    depends_on:
+      pg-source:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # =========================================================================
+  # 5. PgBouncer — Connection Router for Zero-Downtime PAUSE/SWITCH/RESUME Cutover
+  # =========================================================================
+  pgbouncer:
+    build:
+      context: ./lab/pgbouncer
+    restart: unless-stopped
+    environment:
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}
+      SOURCE_MIGRATOR_PASSWORD: ${SOURCE_MIGRATOR_PASSWORD:?SOURCE_MIGRATOR_PASSWORD is required}
+      PGBOUNCER_ADMIN_PASSWORD: ${PGBOUNCER_ADMIN_PASSWORD:?PGBOUNCER_ADMIN_PASSWORD is required}
+    networks:
+      - migration-net
+    depends_on:
+      pg-source:
+        condition: service_healthy
+      pg-target:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # =========================================================================
+  # 6. Example Demo App + Continuous Live Workload (http://127.0.0.1:8081)
+  # =========================================================================
+  workload-sim:
+    build:
+      context: ./lab/workload
+    restart: unless-stopped
+    environment:
+      WORKLOAD_DSN: "host=pgbouncer port=6432 dbname=appdb user=appuser password=${APP_DB_PASSWORD} connect_timeout=15"
+      WORKLOAD_TPS: ${WORKLOAD_TPS:-10}
+      WORKLOAD_AUTOSTART: "true"
+    ports:
+      - "127.0.0.1:${DEMO_APP_PORT:-8081}:8092"
+    networks:
+      - frontend-net
+      - migration-net
+    depends_on:
+      - pgbouncer
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # =========================================================================
+  # 7. TPC-H ~10 GiB Open Dataset Seeder (DuckDB dbgen -> PG COPY)
+  #    Run on-demand via: make seed-10g (or make seed-1g for fast test)
+  # =========================================================================
+  tpch-seeder:
+    build:
+      context: ./lab/seeder
+    profiles: ["seed"]
+    environment:
+      SOURCE_DSN: "host=pg-source port=5432 dbname=sourcedb user=migrator password=${SOURCE_MIGRATOR_PASSWORD}"
+      TPCH_SCALE_FACTOR: ${TPCH_SCALE_FACTOR:-10}
+      FORCE_RESEED: ${FORCE_RESEED:-false}
+    networks:
+      - migration-net
+    depends_on:
+      pg-source:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # =========================================================================
+  # 8. Go Backend Orchestrator (minimal 1-dep binary + pg_dump/psql)
+  # =========================================================================
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      META_DB_URL: "postgres://meta_admin:${META_DB_PASSWORD}@pg-meta:5432/pg_migrator_meta?sslmode=disable"
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY is required}
+      TOXIPROXY_URL: "http://toxiproxy:8474"
+      PGBOUNCER_CONTROL_URL: "http://pgbouncer:8091"
+      WORKLOAD_STATS_URL: "http://workload-sim:8092"
+      SOURCE_MIGRATOR_PASSWORD: ${SOURCE_MIGRATOR_PASSWORD}
+      TARGET_MIGRATOR_PASSWORD: ${TARGET_MIGRATOR_PASSWORD}
+    networks:
+      - frontend-net
+      - meta-net
+      - migration-net
+    depends_on:
+      pg-meta:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # =========================================================================
+  # 9. Hardened React Web UI (Nginx non-root, localhost-only binding)
+  # =========================================================================
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:8080"
+    networks:
+      - frontend-net
+    depends_on:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
