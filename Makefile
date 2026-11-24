@@ -14,6 +14,7 @@ init-env:
 		printf "TARGET_MIGRATOR_PASSWORD=%s\n" "$$(openssl rand -hex 20)" >> .env; \
 		printf "APP_DB_PASSWORD=%s\n" "$$(openssl rand -hex 20)" >> .env; \
 		printf "PGBOUNCER_ADMIN_PASSWORD=%s\n" "$$(openssl rand -hex 20)" >> .env; \
+		printf "GRAFANA_ADMIN_PASSWORD=%s\n" "$$(openssl rand -hex 20)" >> .env; \
 		printf "TPCH_SCALE_FACTOR=10\n" >> .env; \
 		printf "WORKLOAD_TPS=15\n" >> .env; \
 		chmod 600 .env; \
@@ -23,7 +24,9 @@ init-env:
 up: init-env
 	docker compose up -d --build
 	@echo ""
-	@echo "Web UI running at: http://127.0.0.1:8080"
+	@echo "Web UI running at:   http://127.0.0.1:8080"
+	@echo "CloudPay Demo App:   http://127.0.0.1:8081 (Prometheus metrics at /metrics)"
+	@echo "Grafana Dashboard:   http://127.0.0.1:3000 (VictoriaMetrics)"
 	@echo "Next: run 'make seed-10g' (~10-14 GiB TPC-H) or 'make seed-1g' (~1.3 GiB quick test)"
 
 seed-10g:
@@ -65,7 +68,7 @@ audit-supply-chain:
 	@cat frontend/package.json
 	@echo ""
 	@echo "=== 3. Running Docker Image RepoDigests (for SHA256 pinning) ==="
-	@for img in postgres:16.4-alpine postgres:15.8-alpine ghcr.io/shopify/toxiproxy:2.9.0; do \
+	@for img in postgres:16.4-alpine postgres:15.8-alpine ghcr.io/shopify/toxiproxy:2.9.0 prometheuscommunity/postgres-exporter:v0.16.0 victoriametrics/victoria-metrics:v1.106.1 grafana/grafana:11.3.1; do \
 		docker inspect --format='{{index .RepoDigests 0}}' $$img 2>/dev/null || echo "$$img (not pulled yet)"; \
 	done
 	@echo ""

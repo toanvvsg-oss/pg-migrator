@@ -387,7 +387,61 @@ DEMO_HTML = """<!doctype html>
 """
 
 
+def render_prometheus_metrics() -> str:
+    with state_lock:
+        snap = dict(state)
+    active_db = snap["current_db"]
+    is_source = 1 if active_db == "sourcedb" else 0
+    is_target = 1 if active_db == "targetdb" else 0
+    cutover_flag = 1 if snap["cutover_detected_at"] else 0
+    running_flag = 1 if snap["running"] else 0
+    lines = [
+        "# HELP cloudpay_workload_running Whether the CloudPay workload generator is currently running (1=running, 0=paused).",
+        "# TYPE cloudpay_workload_running gauge",
+        f"cloudpay_workload_running {running_flag}",
+        "# HELP cloudpay_workload_target_tps Configured target transactions per second.",
+        "# TYPE cloudpay_workload_target_tps gauge",
+        f"cloudpay_workload_target_tps {snap['target_tps']}",
+        "# HELP cloudpay_workload_actual_tps Measured transactions per second over the last 2s window.",
+        "# TYPE cloudpay_workload_actual_tps gauge",
+        f"cloudpay_workload_actual_tps {snap['actual_tps']}",
+        "# HELP cloudpay_transactions_total Total database operations executed by the CloudPay demo app.",
+        "# TYPE cloudpay_transactions_total counter",
+        f'cloudpay_transactions_total{{op="insert"}} {snap["inserts"]}',
+        f'cloudpay_transactions_total{{op="update"}} {snap["updates"]}',
+        f'cloudpay_transactions_total{{op="delete"}} {snap["deletes"]}',
+        f'cloudpay_transactions_total{{op="error"}} {snap["errors"]}',
+        "# HELP cloudpay_last_tx_id Most recent BIGSERIAL tx_id inserted by CloudPay.",
+        "# TYPE cloudpay_last_tx_id gauge",
+        f"cloudpay_last_tx_id {snap['last_tx_id']}",
+        "# HELP cloudpay_query_latency_ms_avg Rolling average query latency in milliseconds.",
+        "# TYPE cloudpay_query_latency_ms_avg gauge",
+        f"cloudpay_query_latency_ms_avg {snap['avg_latency_ms']}",
+        "# HELP cloudpay_query_latency_ms_max Maximum observed query latency spike in milliseconds.",
+        "# TYPE cloudpay_query_latency_ms_max gauge",
+        f"cloudpay_query_latency_ms_max {snap['max_latency_ms']}",
+        "# HELP cloudpay_active_db Active PostgreSQL database serving CloudPay writes (1=active, 0=inactive).",
+        "# TYPE cloudpay_active_db gauge",
+        f'cloudpay_active_db{{db="sourcedb"}} {is_source}',
+        f'cloudpay_active_db{{db="targetdb"}} {is_target}',
+        "# HELP cloudpay_cutover_detected Whether CloudPay has observed a live database switchover (1=yes, 0=no).",
+        "# TYPE cloudpay_cutover_detected gauge",
+        f"cloudpay_cutover_detected {cutover_flag}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 class StatsHandler(BaseHTTPRequestHandler):
+    def _send_text(self, code: int, text: str, content_type: str):
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json(self, code: int, payload: dict):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(code)
@@ -413,6 +467,9 @@ class StatsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/" or self.path == "/index.html":
             self._send_html(DEMO_HTML)
+            return
+        if self.path == "/metrics":
+            self._send_text(200, render_prometheus_metrics(), "text/plain; version=0.0.4; charset=utf-8")
             return
         if self.path == "/stats":
             with state_lock:

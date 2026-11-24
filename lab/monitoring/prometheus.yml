@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: postgres
+    static_configs:
+      - targets: ["pg-source-exporter:9187"]
+        labels:
+          role: source
+          instance: pg-source
+          db_name: sourcedb
+      - targets: ["pg-target-exporter:9187"]
+        labels:
+          role: target
+          instance: pg-target
+          db_name: targetdb
+
+  - job_name: cloudpay-app
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["workload-sim:8092"]
+        labels:
+          service: cloudpay-demo-app

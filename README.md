@@ -50,7 +50,9 @@ This automatically generates cryptographic random passwords into `.env` (`chmod 
 | Service | URL / Role |
 | :--- | :--- |
 | **Migrator Web UI** | http://127.0.0.1:8080 |
-| **CloudPay Demo App** | http://127.0.0.1:8081 (live ~10 TPS inserts/updates/deletes via PgBouncer) |
+| **CloudPay Demo App** | http://127.0.0.1:8081 (live ~10 TPS inserts/updates/deletes via PgBouncer, Prometheus `/metrics`) |
+| **Grafana Dashboard** | http://127.0.0.1:3000 (pre-provisioned Source/Target PG + CloudPay overview via VictoriaMetrics) |
+| **`victoriametrics`** | Lightweight Prometheus-compatible TSDB scraping `pg-source-exporter`, `pg-target-exporter`, and `workload-sim` |
 | **`pg-meta`** | PostgreSQL 16.4 — state, logs, metrics, AES-256-GCM encrypted credentials |
 | **`pg-source`** | PostgreSQL 15.8 — simulates Cloud A (`wal_level=logical`) |
 | **`pg-target`** | PostgreSQL 16.4 — simulates Cloud B (PG 15 → PG 16 upgrade) |

@@ -12,11 +12,17 @@ networks:
   migration-net:
     driver: bridge
     internal: true
+  # Strictly isolated internal network: VictoriaMetrics <-> Grafana (NO internet egress)
+  monitoring-net:
+    driver: bridge
+    internal: true
 
 volumes:
   pg-meta-data:
   pg-source-data:
   pg-target-data:
+  vm-data:
+  grafana-data:
 
 services:
   # =========================================================================
@@ -252,6 +258,99 @@ services:
       - frontend-net
     depends_on:
       - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # =========================================================================
+  # 10. PostgreSQL Exporters (Source PG 15 & Target PG 16)
+  # =========================================================================
+  pg-source-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_URI: "pg-source:5432/sourcedb?sslmode=disable"
+      DATA_SOURCE_USER: migrator
+      DATA_SOURCE_PASS: ${SOURCE_MIGRATOR_PASSWORD:?SOURCE_MIGRATOR_PASSWORD is required}
+    networks:
+      - migration-net
+    depends_on:
+      pg-source:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  pg-target-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_URI: "pg-target:5432/targetdb?sslmode=disable"
+      DATA_SOURCE_USER: migrator
+      DATA_SOURCE_PASS: ${TARGET_MIGRATOR_PASSWORD:?TARGET_MIGRATOR_PASSWORD is required}
+    networks:
+      - migration-net
+    depends_on:
+      pg-target:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # =========================================================================
+  # 11. VictoriaMetrics (lightweight Prometheus-compatible TSDB, zero egress)
+  # =========================================================================
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.106.1
+    restart: unless-stopped
+    command:
+      - -storageDataPath=/victoria-metrics-data
+      - -retentionPeriod=7d
+      - -promscrape.config=/etc/vm/prometheus.yml
+    volumes:
+      - vm-data:/victoria-metrics-data
+      - ./lab/monitoring/prometheus.yml:/etc/vm/prometheus.yml:ro
+    networks:
+      - migration-net
+      - monitoring-net
+    depends_on:
+      - pg-source-exporter
+      - pg-target-exporter
+      - workload-sim
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # =========================================================================
+  # 12. Grafana (pre-provisioned Migration Overview Dashboard, localhost-only)
+  # =========================================================================
+  grafana:
+    image: grafana/grafana:11.3.1
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/pg-migration-overview.json
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./lab/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./lab/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - frontend-net
+      - monitoring-net
+    depends_on:
+      - victoriametrics
     security_opt:
       - no-new-privileges:true
     cap_drop:

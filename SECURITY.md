@@ -11,13 +11,14 @@ This document summarizes the **Supply Chain Attack** mitigations and infrastruct
 - **Python Lab Containers (`seeder`, `workload`)**:
   - Exact version pinning (`duckdb==1.1.3`, `psycopg[binary]==3.2.3`) with mandatory `--only-binary=:all:` → **prevents arbitrary code execution in `setup.py`** during source tarball builds.
 - **Docker Base Images**:
-  - Uses only Official Library images with pinned versions (`postgres:15.8-alpine`, `postgres:16.4-alpine`, `golang:1.23.4-alpine3.20`, `node:22.12.0-alpine3.20`, `nginx:1.27.3-alpine`, `python:3.12.8-slim`, `ghcr.io/shopify/toxiproxy:2.9.0`).
+  - Uses only official/upstream images with pinned versions (`postgres:15.8-alpine`, `postgres:16.4-alpine`, `golang:1.23.4-alpine3.20`, `node:22.12.0-alpine3.20`, `nginx:1.27.3-alpine`, `python:3.12.8-slim`, `ghcr.io/shopify/toxiproxy:2.9.0`, `prometheuscommunity/postgres-exporter:v0.16.0`, `victoriametrics/victoria-metrics:v1.106.1`, `grafana/grafana:11.3.1`).
   - Run `make audit-supply-chain` to inspect `RepoDigests` (`@sha256:...`) if you want to pin images by immutable digest before production use.
 
 ## 2. Strict Network Isolation (Zero Egress / Exfiltration Blocking)
 - `meta-net` (`internal: true`): Connects only `backend` ↔ `pg-meta`, **with no internet egress**.
-- `migration-net` (`internal: true`): Contains only `pg-source`, `pg-target`, `pgbouncer`, `toxiproxy`, `workload-sim`, and `backend` — **no internet egress** and no PostgreSQL ports exposed to the host.
-- `frontend` binds strictly to `127.0.0.1:8080` (localhost-only access).
+- `migration-net` (`internal: true`): Contains only `pg-source`, `pg-target`, `pg-source-exporter`, `pg-target-exporter`, `pgbouncer`, `toxiproxy`, `workload-sim`, `victoriametrics`, and `backend` — **no internet egress** and no PostgreSQL ports exposed to the host.
+- `monitoring-net` (`internal: true`): Connects only `victoriametrics` ↔ `grafana`, **with no internet egress**.
+- `frontend`, `workload-sim`, and `grafana` bind strictly to `127.0.0.1` (`:8080`, `:8081`, `:3000`, localhost-only access).
 
 ## 3. Credential & Database Hardening
 - **No hardcoded passwords**: `make init-env` generates random passwords and `APP_ENCRYPTION_KEY` via `openssl rand` and sets `chmod 600 .env`.
