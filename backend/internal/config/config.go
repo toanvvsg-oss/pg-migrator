@@ -3,12 +3,14 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 type Config struct {
 	Port                string
 	MetaDBURL           string
 	EncryptionKey       string
+	APIAuthToken        string
 	ToxiproxyURL        string
 	PgBouncerControlURL string
 	WorkloadStatsURL    string
@@ -34,6 +36,7 @@ func Load() (*Config, error) {
 		Port:                port,
 		MetaDBURL:           metaURL,
 		EncryptionKey:       encKey,
+		APIAuthToken:        strings.TrimSpace(os.Getenv("API_AUTH_TOKEN")),
 		ToxiproxyURL:        os.Getenv("TOXIPROXY_URL"),
 		PgBouncerControlURL: os.Getenv("PGBOUNCER_CONTROL_URL"),
 		WorkloadStatsURL:    os.Getenv("WORKLOAD_STATS_URL"),

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,10 +17,11 @@ import (
 )
 
 type Server struct {
-	store  *store.Store
-	engine *migrator.Engine
-	cfg    *config.Config
-	mux    *http.ServeMux
+	store   *store.Store
+	engine  *migrator.Engine
+	cfg     *config.Config
+	mux     *http.ServeMux
+	handler http.Handler
 }
 
 func NewServer(st *store.Store, eng *migrator.Engine, cfg *config.Config) *Server {
@@ -30,14 +32,19 @@ func NewServer(st *store.Store, eng *migrator.Engine, cfg *config.Config) *Serve
 		mux:    http.NewServeMux(),
 	}
 	s.routes()
+	token := ""
+	if cfg != nil {
+		token = cfg.APIAuthToken
+	}
+	s.handler = AuthMiddleware(token, s.mux)
 	return s
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Security headers on API responses
+	// Security headers on API responses (including 401 unauthorized responses)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
-	s.mux.ServeHTTP(w, r)
+	s.handler.ServeHTTP(w, r)
 }
 
 func (s *Server) routes() {
@@ -84,6 +91,10 @@ func decodeJSON(r *http.Request, dst any) error {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		writeErr(w, http.StatusServiceUnavailable, "pg-meta unavailable")
+		return
+	}
 	if err := s.store.Ping(r.Context()); err != nil {
 		writeErr(w, http.StatusServiceUnavailable, "pg-meta unavailable")
 		return
@@ -93,6 +104,22 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"storage": "postgresql (pg-meta)",
 		"time":    time.Now().UTC(),
 	})
+}
+
+func (s *Server) acquireJobLock(w http.ResponseWriter, id, op string) (func(), bool) {
+	if s.engine == nil {
+		return func() {}, true
+	}
+	unlock, err := s.engine.TryLockJob(id, op)
+	if err != nil {
+		if errors.Is(err, migrator.ErrJobLocked) {
+			writeErr(w, http.StatusConflict, err.Error())
+			return nil, false
+		}
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return nil, false
+	}
+	return unlock, true
 }
 
 // handleLabPreset returns non-secret Docker Lab topology defaults.
@@ -229,6 +256,12 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	unlock, ok := s.acquireJobLock(w, id, "delete")
+	if !ok {
+		return
+	}
+	defer unlock()
+
 	s.engine.StopMonitor(id)
 	if err := s.store.DeleteJob(r.Context(), id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -238,7 +271,14 @@ func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePreflight(w http.ResponseWriter, r *http.Request) {
-	job, err := s.store.GetJob(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	unlock, ok := s.acquireJobLock(w, id, "preflight")
+	if !ok {
+		return
+	}
+	defer unlock()
+
+	job, err := s.store.GetJob(r.Context(), id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "job not found")
 		return
@@ -252,7 +292,14 @@ func (s *Server) handlePreflight(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleFixReplicaIdentity(w http.ResponseWriter, r *http.Request) {
-	job, err := s.store.GetJob(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	unlock, ok := s.acquireJobLock(w, id, "fix-replica-identity")
+	if !ok {
+		return
+	}
+	defer unlock()
+
+	job, err := s.store.GetJob(r.Context(), id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "job not found")
 		return
@@ -266,7 +313,14 @@ func (s *Server) handleFixReplicaIdentity(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleSchemaSync(w http.ResponseWriter, r *http.Request) {
-	job, err := s.store.GetJob(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	unlock, ok := s.acquireJobLock(w, id, "schema")
+	if !ok {
+		return
+	}
+	defer unlock()
+
+	job, err := s.store.GetJob(r.Context(), id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "job not found")
 		return
@@ -280,7 +334,14 @@ func (s *Server) handleSchemaSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStartReplication(w http.ResponseWriter, r *http.Request) {
-	job, err := s.store.GetJob(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	unlock, ok := s.acquireJobLock(w, id, "replicate")
+	if !ok {
+		return
+	}
+	defer unlock()
+
+	job, err := s.store.GetJob(r.Context(), id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "job not found")
 		return
@@ -293,7 +354,14 @@ func (s *Server) handleStartReplication(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
-	job, err := s.store.GetJob(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	unlock, ok := s.acquireJobLock(w, id, "verify")
+	if !ok {
+		return
+	}
+	defer unlock()
+
+	job, err := s.store.GetJob(r.Context(), id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "job not found")
 		return
@@ -309,7 +377,14 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCutover(w http.ResponseWriter, r *http.Request) {
-	job, err := s.store.GetJob(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	unlock, ok := s.acquireJobLock(w, id, "cutover")
+	if !ok {
+		return
+	}
+	defer unlock()
+
+	job, err := s.store.GetJob(r.Context(), id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "job not found")
 		return
@@ -325,7 +400,14 @@ func (s *Server) handleCutover(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAbort(w http.ResponseWriter, r *http.Request) {
-	job, err := s.store.GetJob(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	unlock, ok := s.acquireJobLock(w, id, "abort")
+	if !ok {
+		return
+	}
+	defer unlock()
+
+	job, err := s.store.GetJob(r.Context(), id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "job not found")
 		return

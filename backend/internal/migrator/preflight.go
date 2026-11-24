@@ -15,10 +15,13 @@ func (e *Engine) RunPreflight(ctx context.Context, j *store.Job) (*PreflightRepo
 	e.log(ctx, j.ID, "preflight", "info", "Starting pre-flight validation checks...")
 
 	report := &PreflightReport{
-		CheckedAt:       time.Now().UTC(),
-		Passed:          true,
-		TablesWithoutPK: make([]string, 0),
-		Checks:          make([]CheckItem, 0),
+		CheckedAt:         time.Now().UTC(),
+		Passed:            true,
+		TablesWithoutPK:   make([]string, 0),
+		PartitionedTables: make([]string, 0),
+		UnloggedTables:    make([]string, 0),
+		UserTriggers:      make([]string, 0),
+		Checks:            make([]CheckItem, 0),
 	}
 
 	fail := func(name, detail, fix string) {
@@ -144,7 +147,95 @@ func (e *Engine) RunPreflight(ctx context.Context, j *store.Job) (*PreflightRepo
 		}
 	}
 
-	// 7. Sequences Inventory
+	// 7. Partitioned Tables (relkind = 'p')
+	partRows, err := srcConn.Query(ctx, `
+		SELECT n.nspname, c.relname,
+		       (SELECT count(*) FROM pg_inherits i WHERE i.inhparent = c.oid)::int AS part_count
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind = 'p'
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+		ORDER BY n.nspname, c.relname
+	`)
+	if err != nil {
+		warn("Partitioned Tables", fmt.Sprintf("Failed to inspect partitioned tables: %v", err), "")
+	} else {
+		var parts []partitionedTableInfo
+		for partRows.Next() {
+			var p partitionedTableInfo
+			if partRows.Scan(&p.Schema, &p.Table, &p.PartCount) == nil {
+				parts = append(parts, p)
+			}
+		}
+		partRows.Close()
+		chk, summary := evaluatePartitionedTables(parts, j.PublicationName)
+		report.PartitionedTables = summary
+		report.Checks = append(report.Checks, chk)
+		if chk.Status == "fail" {
+			report.Passed = false
+		}
+	}
+
+	// 8. Unlogged Tables (relpersistence = 'u')
+	unloggedRows, err := srcConn.Query(ctx, `
+		SELECT n.nspname, c.relname, c.relkind::text
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relpersistence = 'u'
+		  AND c.relkind IN ('r', 'p')
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+		ORDER BY n.nspname, c.relname
+	`)
+	if err != nil {
+		warn("Unlogged Tables", fmt.Sprintf("Failed to inspect unlogged tables: %v", err), "")
+	} else {
+		var unlogged []unloggedTableInfo
+		for unloggedRows.Next() {
+			var u unloggedTableInfo
+			if unloggedRows.Scan(&u.Schema, &u.Table, &u.RelKind) == nil {
+				unlogged = append(unlogged, u)
+			}
+		}
+		unloggedRows.Close()
+		chk, summary := evaluateUnloggedTables(unlogged)
+		report.UnloggedTables = summary
+		report.Checks = append(report.Checks, chk)
+		if chk.Status == "fail" {
+			report.Passed = false
+		}
+	}
+
+	// 9. User Triggers (NOT tgisinternal)
+	trigRows, err := srcConn.Query(ctx, `
+		SELECT n.nspname, c.relname, t.tgname, t.tgenabled::text
+		FROM pg_trigger t
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE NOT t.tgisinternal
+		  AND c.relkind IN ('r', 'p')
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+		ORDER BY n.nspname, c.relname, t.tgname
+	`)
+	if err != nil {
+		warn("User Triggers", fmt.Sprintf("Failed to inspect user triggers: %v", err), "")
+	} else {
+		var trigs []userTriggerInfo
+		for trigRows.Next() {
+			var tr userTriggerInfo
+			if trigRows.Scan(&tr.Schema, &tr.Table, &tr.Trigger, &tr.Enabled) == nil {
+				trigs = append(trigs, tr)
+			}
+		}
+		trigRows.Close()
+		chk, summary := evaluateUserTriggers(trigs)
+		report.UserTriggers = summary
+		report.Checks = append(report.Checks, chk)
+		if chk.Status == "fail" {
+			report.Passed = false
+		}
+	}
+
+	// 10. Sequences Inventory
 	var seqCount int
 	_ = srcConn.QueryRow(ctx, `
 		SELECT count(*) FROM pg_sequences
@@ -157,7 +248,7 @@ func (e *Engine) RunPreflight(ctx context.Context, j *store.Job) (*PreflightRepo
 		pass("Sequences Inventory", "No user sequences detected")
 	}
 
-	// 8. Extensions Compatibility
+	// 11. Extensions Compatibility
 	srcExts := fetchExtensions(ctx, srcConn)
 	tgtExts := fetchExtensions(ctx, tgtConn)
 	var missingExts []string
@@ -175,7 +266,7 @@ func (e *Engine) RunPreflight(ctx context.Context, j *store.Job) (*PreflightRepo
 		pass("Extensions Parity", "All non-default extensions match or are compatible")
 	}
 
-	// 9. Existing Subscription / Publication Check
+	// 12. Existing Subscription / Publication Check
 	var pubExists, subExists bool
 	_ = srcConn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)", j.PublicationName).Scan(&pubExists)
 	_ = tgtConn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subname = $1)", j.SubscriptionName).Scan(&subExists)
@@ -260,4 +351,145 @@ func fetchExtensions(ctx context.Context, conn *pgx.Conn) map[string]bool {
 		}
 	}
 	return out
+}
+
+type partitionedTableInfo struct {
+	Schema    string
+	Table     string
+	PartCount int
+}
+
+type unloggedTableInfo struct {
+	Schema  string
+	Table   string
+	RelKind string // 'r' or 'p'
+}
+
+type userTriggerInfo struct {
+	Schema  string
+	Table   string
+	Trigger string
+	Enabled string // 'O' (origin), 'D' (disabled), 'R' (replica), 'A' (always)
+}
+
+func evaluatePartitionedTables(parts []partitionedTableInfo, pubName string) (CheckItem, []string) {
+	summary := make([]string, 0, len(parts))
+	if len(parts) == 0 {
+		return CheckItem{
+			Name:   "Partitioned Tables",
+			Status: "pass",
+			Detail: "No partitioned user tables (relkind='p') detected",
+		}, summary
+	}
+
+	emptyRoots := 0
+	for _, p := range parts {
+		summary = append(summary, fmt.Sprintf("%s.%s (%d partitions)", p.Schema, p.Table, p.PartCount))
+		if p.PartCount == 0 {
+			emptyRoots++
+		}
+	}
+
+	detail := fmt.Sprintf("Found %d partitioned table(s): %s. StartReplication publishes existing leaf partitions (relkind='r') without publish_via_partition_root = true; newly attached partitions during CDC will not auto-replicate.",
+		len(parts), strings.Join(summary, ", "))
+	if emptyRoots > 0 {
+		detail += fmt.Sprintf(" (%d root table(s) currently have 0 leaf partitions.)", emptyRoots)
+	}
+
+	if pubName == "" {
+		pubName = "pub_pg_migrator"
+	}
+	fixSQL := fmt.Sprintf("ALTER PUBLICATION %s SET (publish_via_partition_root = true); -- optional if partition root routing is required; freeze partition DDL during migration",
+		pgx.Identifier{pubName}.Sanitize())
+
+	return CheckItem{
+		Name:   "Partitioned Tables",
+		Status: "warn",
+		Detail: detail,
+		FixSQL: fixSQL,
+	}, summary
+}
+
+func evaluateUnloggedTables(unlogged []unloggedTableInfo) (CheckItem, []string) {
+	summary := make([]string, 0, len(unlogged))
+	if len(unlogged) == 0 {
+		return CheckItem{
+			Name:   "Unlogged Tables",
+			Status: "pass",
+			Detail: "No unlogged user tables detected",
+		}, summary
+	}
+
+	fixStmts := make([]string, 0, len(unlogged))
+	for _, u := range unlogged {
+		fq := fmt.Sprintf("%s.%s", u.Schema, u.Table)
+		summary = append(summary, fq)
+		ident := pgx.Identifier{u.Schema, u.Table}.Sanitize()
+		if u.RelKind == "p" {
+			fixStmts = append(fixStmts, fmt.Sprintf("-- Partitioned table %s cannot use ALTER TABLE SET LOGGED directly; alter leaf partitions or recreate as LOGGED", ident))
+		} else {
+			fixStmts = append(fixStmts, fmt.Sprintf("ALTER TABLE %s SET LOGGED;", ident))
+		}
+	}
+
+	return CheckItem{
+		Name:   "Unlogged Tables",
+		Status: "fail",
+		Detail: fmt.Sprintf("Found %d unlogged table(s): %s. PostgreSQL logical replication does not write WAL for unlogged tables and CREATE PUBLICATION fails on them.", len(unlogged), strings.Join(summary, ", ")),
+		FixSQL: strings.Join(fixStmts, "\n"),
+	}, summary
+}
+
+func evaluateUserTriggers(trigs []userTriggerInfo) (CheckItem, []string) {
+	summary := make([]string, 0, len(trigs))
+	if len(trigs) == 0 {
+		return CheckItem{
+			Name:   "User Triggers",
+			Status: "pass",
+			Detail: "No user-defined triggers detected",
+		}, summary
+	}
+
+	var dangerous []string
+	var fixStmts []string
+	for _, tr := range trigs {
+		mode := triggerModeLabel(tr.Enabled)
+		label := fmt.Sprintf("%s.%s.%s (%s)", tr.Schema, tr.Table, tr.Trigger, mode)
+		summary = append(summary, label)
+		if tr.Enabled == "R" || tr.Enabled == "A" {
+			dangerous = append(dangerous, label)
+			fixStmts = append(fixStmts, fmt.Sprintf("ALTER TABLE %s ENABLE TRIGGER %s; -- convert REPLICA/ALWAYS trigger to ORIGIN mode before Schema Sync",
+				pgx.Identifier{tr.Schema, tr.Table}.Sanitize(), pgx.Identifier{tr.Trigger}.Sanitize()))
+		}
+	}
+
+	if len(dangerous) > 0 {
+		return CheckItem{
+			Name:   "User Triggers",
+			Status: "fail",
+			Detail: fmt.Sprintf("Found %d REPLICA/ALWAYS user trigger(s) that will double-fire on Target during logical replication: %s", len(dangerous), strings.Join(dangerous, ", ")),
+			FixSQL: strings.Join(fixStmts, "\n"),
+		}, summary
+	}
+
+	return CheckItem{
+		Name:   "User Triggers",
+		Status: "warn",
+		Detail: fmt.Sprintf("Found %d user trigger(s): %s. Logical Replication skips ORIGIN triggers on Target during CDC (session_replication_role='replica') and activates them once Target receives direct writes at cutover; verify side effects (NOTIFY, sequences, audit tables).", len(trigs), strings.Join(summary, ", ")),
+	}, summary
+}
+
+func triggerModeLabel(code string) string {
+	switch code {
+	case "O":
+		return "origin"
+	case "D":
+		return "disabled"
+	case "R":
+		return "replica"
+	case "A":
+		return "always"
+	default:
+		return code
+	}
 }

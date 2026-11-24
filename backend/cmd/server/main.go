@@ -45,7 +45,11 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("[pg-migrator] listening on :%s (state store: PostgreSQL pg-meta)", cfg.Port)
+		authState := "disabled"
+		if cfg.APIAuthToken != "" {
+			authState = "enabled"
+		}
+		log.Printf("[pg-migrator] listening on :%s (state store: PostgreSQL pg-meta, auth=%s)", cfg.Port, authState)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("http server error: %v", err)
 		}

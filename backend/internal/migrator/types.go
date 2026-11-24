@@ -33,15 +33,18 @@ type CheckItem struct {
 }
 
 type PreflightReport struct {
-	CheckedAt          time.Time   `json:"checked_at"`
-	Passed             bool        `json:"passed"`
-	SourceVersion      string      `json:"source_version"`
-	TargetVersion      string      `json:"target_version"`
-	SourceSizeBytes    int64       `json:"source_size_bytes"`
-	TableCount         int         `json:"table_count"`
-	SequenceCount      int         `json:"sequence_count"`
-	TablesWithoutPK    []string    `json:"tables_without_pk"`
-	Checks             []CheckItem `json:"checks"`
+	CheckedAt         time.Time   `json:"checked_at"`
+	Passed            bool        `json:"passed"`
+	SourceVersion     string      `json:"source_version"`
+	TargetVersion     string      `json:"target_version"`
+	SourceSizeBytes   int64       `json:"source_size_bytes"`
+	TableCount        int         `json:"table_count"`
+	SequenceCount     int         `json:"sequence_count"`
+	TablesWithoutPK   []string    `json:"tables_without_pk"`
+	PartitionedTables []string    `json:"partitioned_tables"`
+	UnloggedTables    []string    `json:"unlogged_tables"`
+	UserTriggers      []string    `json:"user_triggers"`
+	Checks            []CheckItem `json:"checks"`
 }
 
 type TableSyncState struct {
@@ -105,6 +108,7 @@ type CutoverReport struct {
 type Engine struct {
 	store *store.Store
 	cfg   *config.Config
+	locks *JobLocker
 
 	mu          sync.Mutex
 	monitors    map[string]context.CancelFunc
@@ -115,9 +119,14 @@ func NewEngine(st *store.Store, cfg *config.Config) *Engine {
 	return &Engine{
 		store:       st,
 		cfg:         cfg,
+		locks:       NewJobLocker(),
 		monitors:    make(map[string]context.CancelFunc),
 		subscribers: make(map[string]map[chan []byte]struct{}),
 	}
+}
+
+func (e *Engine) TryLockJob(jobID, op string) (func(), error) {
+	return e.locks.TryAcquire(jobID, op)
 }
 
 func (e *Engine) Shutdown() {

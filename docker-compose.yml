@@ -228,6 +228,7 @@ services:
       PORT: "8080"
       META_DB_URL: "postgres://meta_admin:${META_DB_PASSWORD}@pg-meta:5432/pg_migrator_meta?sslmode=disable"
       APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY is required}
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
       TOXIPROXY_URL: "http://toxiproxy:8474"
       PGBOUNCER_CONTROL_URL: "http://pgbouncer:8091"
       WORKLOAD_STATS_URL: "http://workload-sim:8092"

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"pg-migrator/internal/store"
 )
@@ -83,18 +85,26 @@ func (e *Engine) ExecuteCutover(ctx context.Context, j *store.Job, req CutoverRe
 	// ---- DOWNTIME WINDOW STARTS HERE ----
 	downtimeStart := time.Now()
 	pgbPaused := false
+	pgbSwitched := false
 	sourceFrozen := false
 	cutoverSucceeded := false
 
-	// Safety defer: if cutover fails mid-flight, unfreeze source and resume PgBouncer so app is never stuck
+	// Safety defer: if cutover fails mid-flight, unfreeze source (unless PgBouncer already switched)
+	// and resume PgBouncer so app is never stuck.
 	defer func() {
 		if !cutoverSucceeded {
-			if sourceFrozen {
-				_, _ = srcConn.Exec(context.Background(), "SET default_transaction_read_only = off")
-				_, _ = srcConn.Exec(context.Background(), fmt.Sprintf("ALTER DATABASE %s SET default_transaction_read_only = off", pgx.Identifier{j.SourceDB}.Sanitize()))
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer rbCancel()
+
+			if sourceFrozen && !pgbSwitched {
+				e.unfreezeSource(rbCtx, srcConn, j)
 			}
 			if pgbPaused {
-				_ = e.callPgBouncer(context.Background(), "/resume", nil)
+				if err := e.callPgBouncer(rbCtx, "/resume", nil); err != nil {
+					e.log(rbCtx, j.ID, "cutover", "error", "Rollback PgBouncer /resume failed: %v", err)
+				} else {
+					e.log(rbCtx, j.ID, "cutover", "warn", "Rollback: PgBouncer resumed cleanly.")
+				}
 			}
 		}
 	}()
@@ -110,17 +120,27 @@ func (e *Engine) ExecuteCutover(ctx context.Context, j *store.Job, req CutoverRe
 		e.log(ctx, j.ID, "cutover", "info", "PgBouncer PAUSE executed.")
 	}
 
-	// Step 4: Optionally set Source DB to read-only so no stray direct writes happen
+	// Step 4: Set Source DB to read-only (fail-closed) and quiesce active non-migrator sessions
 	if req.SetSourceReadOnly {
 		s4 := time.Now()
 		roSQL := fmt.Sprintf("ALTER DATABASE %s SET default_transaction_read_only = on", pgx.Identifier{j.SourceDB}.Sanitize())
 		if _, err := srcConn.Exec(ctx, roSQL); err != nil {
-			e.log(ctx, j.ID, "cutover", "warn", "Could not set source read-only: %v", err)
-			addStep("Freeze Source Writes", "warn", s4, err.Error())
-		} else {
-			sourceFrozen = true
-			addStep("Freeze Source Writes", "ok", s4, "Source database set to default_transaction_read_only = on")
+			e.log(ctx, j.ID, "cutover", "error", "Failed to set source read-only: %v", err)
+			addStep("Freeze Source Writes", "fail", s4, err.Error())
+			return nil, fmt.Errorf("set source read-only failed: %w", err)
 		}
+		sourceFrozen = true
+		// Keep migrator's own session writable for teardown DDL (DROP PUBLICATION / pg_drop_replication_slot)
+		_, _ = srcConn.Exec(ctx, "SET default_transaction_read_only = off")
+
+		status, detail, qErr := e.quiesceSourceSessions(ctx, srcConn, pgbPaused)
+		if qErr != nil {
+			e.log(ctx, j.ID, "cutover", "error", "Source write-freeze quiesce failed: %v", qErr)
+			addStep("Freeze Source Writes", "fail", s4, qErr.Error())
+			return nil, qErr
+		}
+		addStep("Freeze Source Writes", status, s4, detail)
+		e.log(ctx, j.ID, "cutover", "info", "Source write-freeze complete (%s): %s", status, detail)
 	}
 
 	// Step 5: Wait for WAL replication lag to hit 0 bytes
@@ -142,7 +162,10 @@ func (e *Engine) ExecuteCutover(ctx context.Context, j *store.Job, req CutoverRe
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if finalLag > 0 {
+	if finalLag != 0 {
+		if finalLag < 0 {
+			return nil, fmt.Errorf("replication slot %q unavailable while draining WAL lag", j.SubscriptionName)
+		}
 		return nil, fmt.Errorf("replication lag did not drain to 0 within %ds (remaining: %d bytes)", req.MaxWaitLagSeconds, finalLag)
 	}
 	addStep("Drain WAL Lag to Zero", "ok", s5, "confirmed_flush_lsn caught up to current WAL LSN (0 bytes lag)")
@@ -192,6 +215,7 @@ func (e *Engine) ExecuteCutover(ctx context.Context, j *store.Job, req CutoverRe
 		}); err != nil {
 			return nil, fmt.Errorf("pgbouncer switch failed: %w", err)
 		}
+		pgbSwitched = true
 		if err := e.callPgBouncer(ctx, "/resume", nil); err != nil {
 			return nil, fmt.Errorf("pgbouncer resume failed: %w", err)
 		}
@@ -261,4 +285,156 @@ func (e *Engine) callPgBouncer(ctx context.Context, path string, payload map[str
 		return fmt.Errorf("pgbouncer control %s returned HTTP %d", path, resp.StatusCode)
 	}
 	return nil
+}
+
+func (e *Engine) unfreezeSource(ctx context.Context, srcConn *pgx.Conn, j *store.Job) {
+	unfreezeSQL := fmt.Sprintf("ALTER DATABASE %s SET default_transaction_read_only = off", pgx.Identifier{j.SourceDB}.Sanitize())
+
+	tryExec := func(conn *pgx.Conn) error {
+		if conn == nil || conn.IsClosed() {
+			return fmt.Errorf("connection closed")
+		}
+		if _, err := conn.Exec(ctx, "SET default_transaction_read_only = off"); err != nil {
+			return err
+		}
+		_, err := conn.Exec(ctx, unfreezeSQL)
+		return err
+	}
+
+	if err := tryExec(srcConn); err == nil {
+		e.log(ctx, j.ID, "cutover", "warn", "Rollback: Source database unfrozen (default_transaction_read_only = off).")
+		return
+	}
+
+	freshConn, dialErr := connectSource(ctx, j)
+	if dialErr != nil {
+		e.log(ctx, j.ID, "cutover", "error", "Rollback: failed to reconnect to source to unfreeze read-only: %v", dialErr)
+		return
+	}
+	defer freshConn.Close(ctx)
+
+	if err := tryExec(freshConn); err != nil {
+		e.log(ctx, j.ID, "cutover", "error", "Rollback: failed to unfreeze source database on fresh connection: %v", err)
+		return
+	}
+	e.log(ctx, j.ID, "cutover", "warn", "Rollback: Source database unfrozen via fresh connection.")
+}
+
+func isInsufficientPrivilege(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42501"
+}
+
+// quiesceSourceSessions ensures no active/in-transaction non-migrator client backends remain on Source.
+// It strictly excludes our own connection, walsender processes, and the migrator user (monitor/exporter).
+func (e *Engine) quiesceSourceSessions(ctx context.Context, srcConn *pgx.Conn, pgbPaused bool) (string, string, error) {
+	const countActiveSQL = `
+		SELECT count(*)
+		FROM pg_stat_activity
+		WHERE datname = current_database()
+		  AND pid <> pg_backend_pid()
+		  AND backend_type = 'client backend'
+		  AND usename IS DISTINCT FROM current_user
+		  AND (state <> 'idle' OR xact_start IS NOT NULL)
+	`
+	const terminateActiveSQL = `
+		SELECT count(*), count(*) FILTER (WHERE pg_terminate_backend(pid))
+		FROM pg_stat_activity
+		WHERE datname = current_database()
+		  AND pid <> pg_backend_pid()
+		  AND backend_type = 'client backend'
+		  AND usename IS DISTINCT FROM current_user
+		  AND (state <> 'idle' OR xact_start IS NOT NULL)
+	`
+
+	// Phase 1: Graceful drain of active/in-xact sessions (up to 2s, poll every 100ms).
+	activeCount := 0
+	drainDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := srcConn.QueryRow(ctx, countActiveSQL).Scan(&activeCount); err != nil {
+			return "fail", "", fmt.Errorf("check active source sessions: %w", err)
+		}
+		if activeCount == 0 || !time.Now().Before(drainDeadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return "fail", "", ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	// Phase 2: Terminate lingering active/in-xact writers and verify quiescence (up to 3s).
+	terminatedActive := 0
+	if activeCount > 0 {
+		var matched, killed int
+		if err := srcConn.QueryRow(ctx, terminateActiveSQL).Scan(&matched, &killed); err != nil {
+			if isInsufficientPrivilege(err) {
+				return "fail", "", fmt.Errorf("cannot guarantee write-freeze: %d active non-migrator session(s) remain on source and migrator lacks pg_signal_backend: %w", activeCount, err)
+			}
+			return "fail", "", fmt.Errorf("terminate active source sessions: %w", err)
+		}
+		terminatedActive = killed
+
+		verifyDeadline := time.Now().Add(3 * time.Second)
+		for {
+			if err := srcConn.QueryRow(ctx, countActiveSQL).Scan(&activeCount); err != nil {
+				return "fail", "", fmt.Errorf("verify active source sessions quiesced: %w", err)
+			}
+			if activeCount == 0 || !time.Now().Before(verifyDeadline) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return "fail", "", ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+		if activeCount > 0 {
+			return "fail", "", fmt.Errorf("cannot guarantee write-freeze: %d active non-migrator session(s) remain on source after termination attempt", activeCount)
+		}
+	}
+
+	// Phase 3: Idle session handling.
+	// If PgBouncer is paused, keep idle server sockets intact for zero-drop rollback on /resume.
+	if pgbPaused {
+		detail := "Source read-only set; 0 active non-migrator writers (PgBouncer idle server sockets preserved)"
+		if terminatedActive > 0 {
+			detail = fmt.Sprintf("Source read-only set; terminated %d lingering writer(s), 0 active (PgBouncer idle sockets preserved)", terminatedActive)
+		}
+		return "ok", detail, nil
+	}
+
+	// Direct mode (no PgBouncer): best-effort recycle idle non-migrator sessions so pools reconnect read-only.
+	const countIdleSQL = `
+		SELECT count(*)
+		FROM pg_stat_activity
+		WHERE datname = current_database()
+		  AND pid <> pg_backend_pid()
+		  AND backend_type = 'client backend'
+		  AND usename IS DISTINCT FROM current_user
+		  AND state = 'idle'
+		  AND xact_start IS NULL
+	`
+	const terminateIdleSQL = `
+		SELECT count(*), count(*) FILTER (WHERE pg_terminate_backend(pid))
+		FROM pg_stat_activity
+		WHERE datname = current_database()
+		  AND pid <> pg_backend_pid()
+		  AND backend_type = 'client backend'
+		  AND usename IS DISTINCT FROM current_user
+		  AND state = 'idle'
+		  AND xact_start IS NULL
+	`
+	var idleMatched, idleKilled int
+	if err := srcConn.QueryRow(ctx, terminateIdleSQL).Scan(&idleMatched, &idleKilled); err != nil {
+		if isInsufficientPrivilege(err) {
+			var idleCnt int
+			_ = srcConn.QueryRow(ctx, countIdleSQL).Scan(&idleCnt)
+			return "warn", fmt.Sprintf("Source read-only set (0 active writers; %d idle sessions not recycled: grant pg_signal_backend)", idleCnt), nil
+		}
+		return "warn", fmt.Sprintf("Source read-only set (0 active writers; idle session recycle warning: %v)", err), nil
+	}
+
+	return "ok", fmt.Sprintf("Source read-only set; 0 active writers (terminated %d active, recycled %d idle sessions)", terminatedActive, idleKilled), nil
 }
